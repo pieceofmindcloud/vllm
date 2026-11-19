@@ -1645,6 +1645,14 @@ def get_dcp_world_size_and_rank(enabled: bool = True) -> tuple[int, int]:
 _PP: GroupCoordinator | None = None
 
 
+def install_stream_pipeline_group(group: Any) -> None:
+    """Replace the pipeline group with a stream-joined one
+    (`stream_pipeline.StreamPipelineGroup`): this process is one stage, its
+    neighbours are reached over byte streams."""
+    global _PP
+    _PP = group
+
+
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP

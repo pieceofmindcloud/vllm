@@ -535,6 +535,11 @@ class EngineArgs:
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
+    pipeline_stream_stage: int | None = ParallelConfig.pipeline_stream_stage
+    pipeline_stream_prev: str | None = ParallelConfig.pipeline_stream_prev
+    pipeline_stream_listen: str | None = ParallelConfig.pipeline_stream_listen
+    pipeline_stream_wire_dtype: str | None = ParallelConfig.pipeline_stream_wire_dtype
+    pipeline_stream_layers: str | None = ParallelConfig.pipeline_stream_layers
     node_rank: int = ParallelConfig.node_rank
     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
     cpu_distributed_timeout_seconds: int | None = (
@@ -1190,6 +1195,21 @@ class EngineArgs:
         parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
         parallel_group.add_argument("--nnodes", "-n", **parallel_kwargs["nnodes"])
+        parallel_group.add_argument(
+            "--pipeline-stream-stage", **parallel_kwargs["pipeline_stream_stage"]
+        )
+        parallel_group.add_argument(
+            "--pipeline-stream-prev", **parallel_kwargs["pipeline_stream_prev"]
+        )
+        parallel_group.add_argument(
+            "--pipeline-stream-listen", **parallel_kwargs["pipeline_stream_listen"]
+        )
+        parallel_group.add_argument(
+            "--pipeline-stream-wire-dtype", **parallel_kwargs["pipeline_stream_wire_dtype"]
+        )
+        parallel_group.add_argument(
+            "--pipeline-stream-layers", **parallel_kwargs["pipeline_stream_layers"]
+        )
         parallel_group.add_argument("--node-rank", "-r", **parallel_kwargs["node_rank"])
         parallel_group.add_argument(
             "--distributed-timeout-seconds",
@@ -2611,6 +2631,11 @@ class EngineArgs:
             master_addr=self.master_addr,
             master_port=self.master_port,
             nnodes=self.nnodes,
+            pipeline_stream_stage=self.pipeline_stream_stage,
+            pipeline_stream_prev=self.pipeline_stream_prev,
+            pipeline_stream_listen=self.pipeline_stream_listen,
+            pipeline_stream_wire_dtype=self.pipeline_stream_wire_dtype,
+            pipeline_stream_layers=self.pipeline_stream_layers,
             node_rank=self.node_rank,
             distributed_timeout_seconds=self.distributed_timeout_seconds,
             cpu_distributed_timeout_seconds=self.cpu_distributed_timeout_seconds,

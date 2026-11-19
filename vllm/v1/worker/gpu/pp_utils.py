@@ -3,6 +3,7 @@
 """Pipeline Parallelism utils for V2 Model Runner."""
 
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -33,6 +34,9 @@ class PendingRecv:
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+    # Stream pipeline transport: the receive runs off the step, in order; its
+    # result is the event recorded once the tokens are on the device.
+    ready: Future | None = None
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -94,9 +98,31 @@ class PPHandler:
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
+        # The stream transport receives the broadcast on its own thread, in
+        # order: an earlier stage asks for step T's tokens before it has sent
+        # step T's intermediate tensors, so a blocking receive would deadlock.
+        self.stream_transport = bool(
+            getattr(self.broadcast_group, "use_stream_transport", False)
+        )
+        self._stream_receiver = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="pp-stream-recv")
+            if self.stream_transport and not self.is_last_rank
+            else None
+        )
         # Whether sampled tokens were broadcast this step.
         self.sampled_tokens_broadcast = False
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+
+    def _broadcast(self, tensor: torch.Tensor) -> None:
+        """The last rank's ``tensor`` into the same tensor of every rank: over
+        the stream pipeline transport when the stages use it, else NCCL."""
+        if getattr(self.broadcast_group, "use_stream_transport", False):
+            torch.cuda.current_stream(self.device).synchronize()
+            self.broadcast_group.broadcast_tensor(tensor)
+            return
+        torch.distributed.broadcast(
+            tensor, src=self.last_rank, group=self.broadcast_group
+        )
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -153,7 +179,10 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
-        self.main_stream.wait_event(slot.event)
+        if slot.ready is not None:
+            self.main_stream.wait_event(slot.ready.result())
+        else:
+            self.main_stream.wait_event(slot.event)
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
@@ -168,9 +197,7 @@ class PPHandler:
         if self.sampled_tokens_broadcast:
             with torch.cuda.stream(self.broadcast_stream):
                 self.broadcast_stream.wait_stream(self.main_stream)
-                torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
-                )
+                self._broadcast(draft_tokens)
                 draft_tokens.record_stream(self.broadcast_stream)
 
     def receive(self, input_batch: InputBatch, recv_drafts: bool) -> bool:
@@ -188,6 +215,10 @@ class PPHandler:
         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
 
         num_reqs = input_batch.num_reqs
+        if self._stream_receiver is not None:
+            return self._receive_from_stream(
+                input_batch, recv_drafts, need_sampled_mask, gen_at_receive_np
+            )
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             sample_len = self._sample_len(input_batch)
@@ -195,20 +226,14 @@ class PPHandler:
                 num_reqs, sample_len, dtype=torch.int64, device=self.device
             )
             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
-            torch.distributed.broadcast(
-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
-            )
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            self._broadcast(sampled_tokens)
+            self._broadcast(combined)
             draft_tokens = None
             if recv_drafts:
                 draft_tokens = sampled_tokens.new_empty(
                     num_reqs, self.num_speculative_steps
                 )
-                torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
-                )
+                self._broadcast(draft_tokens)
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
@@ -227,6 +252,52 @@ class PPHandler:
             need_sampled_mask,
             gen_at_receive_np,
             draft_tokens,
+        )
+        return bool(need_sampled_mask.all())
+
+    def _receive_from_stream(
+        self,
+        input_batch: InputBatch,
+        recv_drafts: bool,
+        need_sampled_mask: np.ndarray,
+        gen_at_receive_np: np.ndarray,
+    ) -> bool:
+        num_reqs = input_batch.num_reqs
+        sampled_tokens = torch.empty(
+            num_reqs, self._sample_len(input_batch), dtype=torch.int64, device=self.device
+        )
+        combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
+        draft_tokens = (
+            sampled_tokens.new_empty(num_reqs, self.num_speculative_steps)
+            if recv_drafts
+            else None
+        )
+        group = self.broadcast_group
+        stream = self.broadcast_stream
+
+        def receive() -> torch.cuda.Event:
+            # The tensors were made under the step's inference mode; this
+            # thread writes into them, so it runs under it too.
+            with torch.inference_mode(), torch.cuda.stream(stream):
+                for tensor in (sampled_tokens, combined, draft_tokens):
+                    if tensor is not None:
+                        group.broadcast_tensor(tensor)
+                return stream.record_event()
+
+        assert self._stream_receiver is not None
+        ready = self._stream_receiver.submit(receive)
+        num_sampled, num_rejected = combined.unbind(dim=0)
+        self.queue[-1] = PendingRecv(
+            None,  # type: ignore[arg-type]
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            need_sampled_mask,
+            gen_at_receive_np,
+            draft_tokens,
+            ready,
         )
         return bool(need_sampled_mask.all())
 
@@ -253,14 +324,8 @@ class PPHandler:
             self.broadcast_stream.wait_stream(self.main_stream)
             # receive() allocates the same width on the other ranks.
             assert sampled_token_ids.shape[-1] == self._sample_len(input_batch)
-            torch.distributed.broadcast(
-                sampled_token_ids.contiguous(),
-                src=self.last_rank,
-                group=self.broadcast_group,
-            )
+            self._broadcast(sampled_token_ids.contiguous())
             combined = torch.stack((num_sampled, num_rejected), dim=0)
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            self._broadcast(combined)
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)

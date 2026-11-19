@@ -208,6 +208,30 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
+def stream_stage_layers(num_hidden_layers: int, pp_rank: int) -> tuple[int, int] | None:
+    """The layers of this process's stream pipeline stage, when its config
+    names them (`pipeline_stream_layers`, "start:end") and `pp_rank` is its
+    stage; None otherwise."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return None
+    parallel = config.parallel_config
+    if not parallel.uses_pipeline_stream or not parallel.pipeline_stream_layers:
+        return None
+    if pp_rank != parallel.pipeline_stream_stage:
+        return None
+    start, _, end = parallel.pipeline_stream_layers.partition(":")
+    start_layer, end_layer = int(start), int(end)
+    if not 0 <= start_layer < end_layer <= num_hidden_layers:
+        raise ValueError(
+            f"pipeline_stream_layers {parallel.pipeline_stream_layers} is outside "
+            f"the model's {num_hidden_layers} layers"
+        )
+    return start_layer, end_layer
+
+
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> tuple[int, int]:
@@ -224,6 +248,9 @@ def get_pp_indices(
     because they contain the input and output embeddings respectively and we
     are attempting to reduce maximum memory consumption across partitions.
     """
+    explicit = stream_stage_layers(num_hidden_layers, pp_rank)
+    if explicit is not None:
+        return explicit
     partition_list_str = envs.VLLM_PP_LAYER_PARTITION
     if partition_list_str is not None:
         try:
