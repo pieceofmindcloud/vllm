@@ -356,6 +356,10 @@ class ParallelConfig:
     pipeline_stream_listen: str | None = None
     """host:port where this stage listens for the next one (every stage but
     the last)."""
+    pipeline_stream_layers: str | None = None
+    """"start:end": the layers this stream stage runs, overriding the even
+    split (`VLLM_PP_LAYER_PARTITION`), so a stage needs to know only its own
+    range."""
     pipeline_stream_wire_dtype: str | None = None
     """Floating type of the intermediate tensors on the stream (float32,
     float16 or bfloat16); None keeps the model's."""

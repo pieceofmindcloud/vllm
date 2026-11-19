@@ -539,6 +539,7 @@ class EngineArgs:
     pipeline_stream_prev: str | None = ParallelConfig.pipeline_stream_prev
     pipeline_stream_listen: str | None = ParallelConfig.pipeline_stream_listen
     pipeline_stream_wire_dtype: str | None = ParallelConfig.pipeline_stream_wire_dtype
+    pipeline_stream_layers: str | None = ParallelConfig.pipeline_stream_layers
     node_rank: int = ParallelConfig.node_rank
     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
     cpu_distributed_timeout_seconds: int | None = (
@@ -1205,6 +1206,9 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--pipeline-stream-wire-dtype", **parallel_kwargs["pipeline_stream_wire_dtype"]
+        )
+        parallel_group.add_argument(
+            "--pipeline-stream-layers", **parallel_kwargs["pipeline_stream_layers"]
         )
         parallel_group.add_argument("--node-rank", "-r", **parallel_kwargs["node_rank"])
         parallel_group.add_argument(
@@ -2631,6 +2635,7 @@ class EngineArgs:
             pipeline_stream_prev=self.pipeline_stream_prev,
             pipeline_stream_listen=self.pipeline_stream_listen,
             pipeline_stream_wire_dtype=self.pipeline_stream_wire_dtype,
+            pipeline_stream_layers=self.pipeline_stream_layers,
             node_rank=self.node_rank,
             distributed_timeout_seconds=self.distributed_timeout_seconds,
             cpu_distributed_timeout_seconds=self.cpu_distributed_timeout_seconds,
