@@ -10,13 +10,16 @@ It loads its layers (``VLLM_PP_LAYER_PARTITION`` or the even split), joins
 its neighbours (``vllm.distributed.stream_pipeline``) and runs the calls the
 last stage sends (``StreamPipelineExecutor``) until the stream closes. It
 takes the same engine options as the last stage, so every stage builds the
-same configuration.
+same configuration. With ``--tensor-parallel-size`` above 1 the stage runs
+one worker process per rank (``StreamStageWorkers``), each serving the calls
+in step with the others.
 """
 
 from __future__ import annotations
 
 import pickle
 import sys
+from typing import Any
 from multiprocessing import Lock
 
 from vllm.distributed.parallel_state import get_pp_group
@@ -33,13 +36,17 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
-def build_worker(engine_args: EngineArgs) -> WorkerWrapperBase:
-    vllm_config = engine_args.create_engine_config()
+def check_stage(vllm_config: Any) -> None:
     parallel = vllm_config.parallel_config
     if not parallel.uses_pipeline_stream:
         raise SystemExit("a pipeline stage needs --pipeline-stream-stage")
     if parallel.pipeline_stream_stage == parallel.pipeline_parallel_size - 1:
         raise SystemExit("the last stage runs the engine (vllm serve), not this")
+
+
+def build_worker(vllm_config: Any) -> WorkerWrapperBase:
+    check_stage(vllm_config)
+    parallel = vllm_config.parallel_config
     device = str(vllm_config.device_config.device).split(":")
     local_rank = int(device[1]) if len(device) > 1 else 0
     worker = WorkerWrapperBase(rpc_rank=0, global_rank=parallel.pipeline_stream_stage)
@@ -60,7 +67,9 @@ def build_worker(engine_args: EngineArgs) -> WorkerWrapperBase:
     return worker
 
 
-def serve(worker: WorkerWrapperBase) -> None:
+def serve(worker: Any) -> None:
+    """Runs the last stage's calls on this worker until the stream closes;
+    every tensor-parallel rank of the stage runs it in step."""
     calls = StageCalls(get_pp_group())
 
     def run(payload: bytes) -> bytes:
@@ -90,7 +99,18 @@ def main(argv: list[str] | None = None) -> None:
     if args.model_tag:
         args.model = args.model_tag
     engine_args = EngineArgs.from_cli_args(args)
-    serve(build_worker(engine_args))
+    vllm_config = engine_args.create_engine_config()
+    if vllm_config.parallel_config.world_size == 1:
+        serve(build_worker(vllm_config))
+        return
+    check_stage(vllm_config)
+    from vllm.v1.executor.stream_pipeline_executor import StreamStageWorkers
+
+    workers = StreamStageWorkers(vllm_config)
+    try:
+        workers.collective_rpc(serve)
+    finally:
+        workers.shutdown()
 
 
 if __name__ == "__main__":

@@ -102,3 +102,14 @@ def test_a_cpu_all_reduce_sums_over_every_stage():
     for t in threads:
         t.join(5)
     assert [int(v.item()) for v in values] == [6, 6, 6]
+
+
+def test_a_stage_takes_its_place_after_the_earlier_stages_ranks():
+    # stage 0 runs two tensor-parallel ranks, so stage 1's rank comes third
+    first, last = _chain(2)
+    last.rank_offset = 2
+    assert first.pipeline_rank == 0 and last.pipeline_rank == 2
+    first.next.send(sp.OFFSET, (2).to_bytes(4, "little"))
+    assert int.from_bytes(last.prev.recv(sp.OFFSET, timeout=5), "little") == 2
+    last.destroy()
+    assert last.prev is None and last.next is None
