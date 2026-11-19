@@ -344,6 +344,21 @@ class ParallelConfig:
     nnodes: int = Field(default=1, ge=1)
     """num of nodes for multi-node distributed
     inference when distributed_executor_backend is mp."""
+    pipeline_stream_stage: int | None = None
+    """This process's stage when the pipeline stages are joined by byte
+    streams (`vllm.distributed.stream_pipeline`) instead of one
+    torch.distributed world: each stage is its own process (its tensor
+    parallel ranks only) and `pipeline_parallel_size` is the number of
+    stages. None: the usual pipeline parallelism."""
+    pipeline_stream_prev: str | None = None
+    """host:port where the previous stage listens for this one (every stage
+    but the first)."""
+    pipeline_stream_listen: str | None = None
+    """host:port where this stage listens for the next one (every stage but
+    the last)."""
+    pipeline_stream_wire_dtype: str | None = None
+    """Floating type of the intermediate tensors on the stream (float32,
+    float16 or bfloat16); None keeps the model's."""
     numa_bind: bool | None = None
     """Enable NUMA binding for GPU worker subprocesses.
 
@@ -1052,13 +1067,38 @@ class ParallelConfig:
 
         return get_compile_factors(self, ignored_factors)
 
+    @property
+    def uses_pipeline_stream(self) -> bool:
+        return self.pipeline_stream_stage is not None
+
     def __post_init__(self) -> None:
         # Continue with the rest of the initialization
+        # A stream-joined stage is a process group of its own: its world is
+        # its tensor (and context) parallel ranks, not the whole pipeline.
+        local_pipeline = 1 if self.uses_pipeline_stream else self.pipeline_parallel_size
         self.world_size = (
-            self.pipeline_parallel_size
+            local_pipeline
             * self.tensor_parallel_size
             * self.prefill_context_parallel_size
         )
+        if self.uses_pipeline_stream:
+            stage = self.pipeline_stream_stage
+            if not 0 <= stage < self.pipeline_parallel_size:
+                raise ValueError(
+                    f"pipeline_stream_stage {stage} is outside the "
+                    f"{self.pipeline_parallel_size} pipeline stages"
+                )
+            if (stage > 0) != bool(self.pipeline_stream_prev):
+                raise ValueError("every stream stage but the first needs pipeline_stream_prev")
+            last = stage == self.pipeline_parallel_size - 1
+            if (not last) != bool(self.pipeline_stream_listen):
+                raise ValueError("every stream stage but the last needs pipeline_stream_listen")
+            if self.distributed_executor_backend is None and last:
+                from vllm.v1.executor.stream_pipeline_executor import (
+                    StreamPipelineExecutor,
+                )
+
+                self.distributed_executor_backend = StreamPipelineExecutor
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")

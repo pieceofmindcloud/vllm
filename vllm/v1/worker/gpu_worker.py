@@ -1858,10 +1858,15 @@ def init_worker_distributed_environment(
 
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
-        parallel_config.pipeline_parallel_size,
+        1 if parallel_config.uses_pipeline_stream else parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+    if parallel_config.uses_pipeline_stream:
+        from vllm.distributed.parallel_state import install_stream_pipeline_group
+        from vllm.distributed.stream_pipeline import open_stage_group
+
+        install_stream_pipeline_group(open_stage_group(parallel_config, local_rank))
 
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode

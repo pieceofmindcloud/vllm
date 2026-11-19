@@ -91,3 +91,14 @@ def test_a_closed_stream_ends_the_call_loop():
     a, b = _chain(2)
     b.prev.close()
     assert sp.StageCalls(a).serve_one(lambda payload: b"") is False
+
+
+def test_a_cpu_all_reduce_sums_over_every_stage():
+    groups = _chain(3)
+    values = [torch.tensor([i + 1], dtype=torch.int32) for i in range(3)]
+    threads = [threading.Thread(target=g.cpu_all_reduce_, args=(v,)) for g, v in zip(groups, values)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert [int(v.item()) for v in values] == [6, 6, 6]

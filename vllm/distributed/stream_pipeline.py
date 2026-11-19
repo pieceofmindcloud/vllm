@@ -36,8 +36,10 @@ TENSORS = 1
 BROADCAST = 2
 CALL = 3
 REPLY = 4
+REDUCE_UP = 5
+REDUCE_DOWN = 6
 
-_KINDS = (TENSORS, BROADCAST, CALL, REPLY)
+_KINDS = (TENSORS, BROADCAST, CALL, REPLY, REDUCE_UP, REDUCE_DOWN)
 
 _DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
@@ -245,6 +247,23 @@ class StreamPipelineGroup:
     def make_sibling_device_group(self, group_desc: str | None = None):
         return self
 
+    # Small CPU collectives every stage makes at the same point (warm-up
+    # decisions): summed forward to the last stage, the sum sent back.
+    def cpu_all_reduce_(self, tensor: torch.Tensor) -> torch.Tensor:
+        total = tensor.clone()
+        if self.prev is not None:
+            total += decode_tensors(self.prev.recv(REDUCE_UP))["t"].reshape(tensor.shape)
+        if self.next is not None:
+            self.next.send(REDUCE_UP, encode_tensors({"t": total}))
+            total = decode_tensors(self.next.recv(REDUCE_DOWN))["t"].reshape(tensor.shape)
+        if self.prev is not None:
+            self.prev.send(REDUCE_DOWN, encode_tensors({"t": total}))
+        tensor.copy_(total)
+        return tensor
+
+    def barrier(self) -> None:
+        self.cpu_all_reduce_(torch.zeros(1, dtype=torch.int32))
+
 
 class StageCalls:
     """Collective calls driven by the last stage over the streams.
@@ -312,11 +331,45 @@ def _split_replies(blob: bytes) -> list[bytes]:
 
 
 def connect(addr: str, timeout: float = 600.0) -> FramedStream:
-    """The stream to the previous stage, which listens at ``host:port``."""
+    """The stream to the previous stage, which listens at ``host:port``.
+    Retries until ``timeout``: the previous stage may still be starting."""
+    import time
+
     host, _, port = addr.rpartition(":")
-    sock = socket.create_connection((host.strip("[]"), int(port)), timeout=timeout)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            sock = socket.create_connection((host.strip("[]"), int(port)), timeout=10)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
     sock.settimeout(None)
     return FramedStream(sock)
+
+
+def open_stage_group(parallel_config: Any, local_rank: int = 0) -> "StreamPipelineGroup":
+    """This process's pipeline group from its parallel config: connect to the
+    previous stage first, then wait for the next one (so the chain forms from
+    the first stage on, whatever order the processes start in)."""
+    if parallel_config.tensor_parallel_size != 1:
+        raise NotImplementedError(
+            "stream pipeline stages run one tensor-parallel rank each for now"
+        )
+    stage = parallel_config.pipeline_stream_stage
+    stages = parallel_config.pipeline_parallel_size
+    prev = connect(parallel_config.pipeline_stream_prev) if stage > 0 else None
+    nxt = accept(parallel_config.pipeline_stream_listen) if stage < stages - 1 else None
+    wire = parallel_config.pipeline_stream_wire_dtype
+    return StreamPipelineGroup(
+        stage,
+        stages,
+        prev,
+        nxt,
+        device=torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu",
+        wire_dtype=_DTYPES[wire] if wire else None,
+    )
 
 
 def accept(addr: str, timeout: float | None = None) -> FramedStream:
