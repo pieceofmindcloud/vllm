@@ -26,6 +26,7 @@ bytes of each tensor in order.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import socket
@@ -345,6 +346,22 @@ class StreamPipelineGroup:
 
     def make_sibling_device_group(self, group_desc: str | None = None):
         return self
+
+    @contextlib.contextmanager
+    def graph_capture(self, graph_capture_context: Any = None):
+        """CUDA graph capture: nothing of this group runs inside a captured
+        graph (the streams carry tensors between steps), so it only enters
+        the capture stream, as ``GroupCoordinator.graph_capture`` does."""
+        if graph_capture_context is None:
+            from vllm.distributed.parallel_state import GraphCaptureContext
+
+            graph_capture_context = GraphCaptureContext(torch.cuda.Stream())
+        stream = graph_capture_context.stream
+        current = torch.cuda.current_stream()
+        if current != stream:
+            stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            yield graph_capture_context
 
     # Small CPU collectives every stage makes at the same point (warm-up
     # decisions): summed forward to the last stage, the sum sent back.
