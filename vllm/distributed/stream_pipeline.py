@@ -14,6 +14,10 @@ that stream, staged through host memory, so stages need no shared
 - backward (stage ``r + 1`` to ``r``): the collective calls the driving stage
   makes (``CALL``) and the sampled tokens it broadcasts (``BROADCAST``).
 
+A stage with several tensor-parallel ranks has one stream per neighbour, held
+by its tensor-parallel rank 0 (the leader); the leader relays what crosses
+the stream to the other ranks of its stage (``StageLocal``).
+
 A frame is a little-endian ``u32`` length followed by that many bytes; the
 first byte of the payload is its kind. A tensor payload is a ``u32`` header
 length, a JSON header (names, dtypes, shapes, the wire dtype) and the raw
@@ -38,8 +42,10 @@ CALL = 3
 REPLY = 4
 REDUCE_UP = 5
 REDUCE_DOWN = 6
+# At startup, from each stage to the next: how many ranks come before it.
+OFFSET = 7
 
-_KINDS = (TENSORS, BROADCAST, CALL, REPLY, REDUCE_UP, REDUCE_DOWN)
+_KINDS = (TENSORS, BROADCAST, CALL, REPLY, REDUCE_UP, REDUCE_DOWN, OFFSET)
 
 _DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
@@ -171,6 +177,56 @@ class FramedStream:
                 q.put(None)
 
 
+class StageLocal:
+    """The tensor-parallel ranks of one stage. Rank 0, the leader, holds the
+    streams; what crosses them reaches the other ranks over gloo groups of
+    the stage's own world: ``tokens`` for the sampled-token broadcast (it runs
+    on the receiver thread), ``control`` for the calls and the CPU
+    collectives (on the main thread), so the two never interleave."""
+
+    def __init__(self, rank: int, size: int):
+        import torch.distributed as dist
+
+        ranks = list(range(dist.get_world_size()))
+        assert len(ranks) == size, "a stream stage's world is its tensor-parallel ranks"
+        self.rank = rank
+        self.size = size
+        self.tokens = dist.new_group(ranks, backend="gloo")
+        self.control = dist.new_group(ranks, backend="gloo")
+        self.leader = dist.get_global_rank(self.control, 0)
+
+    @property
+    def is_leader(self) -> bool:
+        return self.rank == 0
+
+    def share_tensor(self, tensor: torch.Tensor, group: Any) -> None:
+        """The leader's ``tensor`` into the same tensor of every rank."""
+        import torch.distributed as dist
+
+        if self.is_leader:
+            staged = tensor.detach().contiguous().cpu()
+        else:
+            staged = torch.empty(tensor.shape, dtype=tensor.dtype)
+        dist.broadcast(staged, src=self.leader, group=group)
+        if not self.is_leader:
+            tensor.copy_(staged.reshape(tensor.shape))
+
+    def share_object(self, value: Any, group: Any) -> Any:
+        import torch.distributed as dist
+
+        box = [value]
+        dist.broadcast_object_list(box, src=self.leader, group=group)
+        return box[0]
+
+    def gather_objects(self, value: Any, group: Any) -> list[Any] | None:
+        """Every rank's ``value`` on the leader, in rank order; None elsewhere."""
+        import torch.distributed as dist
+
+        out: list[Any] | None = [None] * self.size if self.is_leader else None
+        dist.gather_object(value, out, dst=self.leader, group=group)
+        return out
+
+
 class StreamPipelineGroup:
     """The pipeline group of a stage joined to its neighbours by streams.
 
@@ -188,10 +244,15 @@ class StreamPipelineGroup:
         next: FramedStream | None,
         device: torch.device | str = "cpu",
         wire_dtype: torch.dtype | None = None,
+        local: StageLocal | None = None,
+        rank_offset: int = 0,
     ):
         assert 0 <= stage < num_stages
-        assert (prev is None) == (stage == 0)
-        assert (next is None) == (stage == num_stages - 1)
+        if local is None or local.is_leader:
+            assert (prev is None) == (stage == 0)
+            assert (next is None) == (stage == num_stages - 1)
+        else:
+            assert prev is None and next is None, "only the leader holds the streams"
         self.rank_in_group = stage
         self.world_size = num_stages
         self.ranks = list(range(num_stages))
@@ -201,7 +262,26 @@ class StreamPipelineGroup:
         self.next = next
         self.device = device
         self.wire_dtype = wire_dtype
+        self.local = local
+        # The ranks of the earlier stages: this stage's ranks follow them in
+        # the engine's per-worker lists (one per rank of the whole pipeline).
+        self.rank_offset = rank_offset
         self.use_stream_transport = True
+
+    @property
+    def pipeline_rank(self) -> int:
+        """This process's position in the pipeline's per-worker lists."""
+        return self.rank_offset + (self.local.rank if self.local is not None else 0)
+
+    def destroy(self) -> None:
+        for stream in (self.prev, self.next):
+            if stream is not None:
+                stream.close()
+        self.prev = self.next = None
+
+    @property
+    def is_leader(self) -> bool:
+        return self.local is None or self.local.is_leader
 
     @property
     def is_first_rank(self) -> bool:
@@ -213,7 +293,11 @@ class StreamPipelineGroup:
 
     # Intermediate tensors, forward.
     def send_tensor_dict(self, tensor_dict: dict[str, Any], dst: int | None = None, **_):
-        assert self.next is not None, "the last stage sends no intermediate tensors"
+        assert not self.is_last_rank, "the last stage sends no intermediate tensors"
+        if not self.is_leader:
+            # every rank holds the same tensors; the leader sends them
+            return None
+        assert self.next is not None
         tensors = {k: v for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)}
         self.next.send(TENSORS, encode_tensors(tensors, self.wire_dtype))
         return None
@@ -223,8 +307,17 @@ class StreamPipelineGroup:
         return []
 
     def recv_tensor_dict(self, src: int | None = None, **_) -> dict[str, torch.Tensor]:
-        assert self.prev is not None, "the first stage receives no intermediate tensors"
-        return decode_tensors(self.prev.recv(TENSORS), self.device)
+        assert not self.is_first_rank, "the first stage receives no intermediate tensors"
+        tensors = None
+        if self.is_leader:
+            assert self.prev is not None
+            tensors = decode_tensors(self.prev.recv(TENSORS), self.device)
+        if self.local is None:
+            return tensors
+        # the stage's other ranks get them from the leader over the device
+        from vllm.distributed.parallel_state import get_tp_group
+
+        return get_tp_group().broadcast_tensor_dict(tensors, src=0)
 
     def irecv_tensor_dict(self, src: int | None = None, **_):
         return self.recv_tensor_dict(), [], None
@@ -234,15 +327,19 @@ class StreamPipelineGroup:
         """In place on every stage: the last stage's ``tensor`` is copied into
         the same-shaped ``tensor`` of every earlier stage."""
         if self.is_last_rank:
+            # every rank of the last stage sampled the same tokens
             if self.prev is not None:
                 self.prev.send(BROADCAST, encode_tensors({"t": tensor}))
             return
-        assert self.next is not None
-        payload = self.next.recv(BROADCAST)
-        if self.prev is not None:
-            self.prev.send(BROADCAST, payload)
-        received = decode_tensors(payload, tensor.device)["t"]
-        tensor.copy_(received.reshape(tensor.shape))
+        if self.is_leader:
+            assert self.next is not None
+            payload = self.next.recv(BROADCAST)
+            if self.prev is not None:
+                self.prev.send(BROADCAST, payload)
+            received = decode_tensors(payload, tensor.device)["t"]
+            tensor.copy_(received.reshape(tensor.shape))
+        if self.local is not None:
+            self.local.share_tensor(tensor, self.local.tokens)
 
     def make_sibling_device_group(self, group_desc: str | None = None):
         return self
@@ -251,15 +348,24 @@ class StreamPipelineGroup:
     # decisions): summed forward to the last stage, the sum sent back.
     def cpu_all_reduce_(self, tensor: torch.Tensor) -> torch.Tensor:
         total = tensor.clone()
-        if self.prev is not None:
-            total += decode_tensors(self.prev.recv(REDUCE_UP))["t"].reshape(tensor.shape)
-        if self.next is not None:
-            self.next.send(REDUCE_UP, encode_tensors({"t": total}))
-            total = decode_tensors(self.next.recv(REDUCE_DOWN))["t"].reshape(tensor.shape)
-        if self.prev is not None:
-            self.prev.send(REDUCE_DOWN, encode_tensors({"t": total}))
+        if self.is_leader:
+            total = self._reduce_over_streams(total)
+        if self.local is not None:
+            self.local.share_tensor(total, self.local.control)
         tensor.copy_(total)
         return tensor
+
+    def _reduce_over_streams(self, total: torch.Tensor) -> torch.Tensor:
+        """Summed forward to the last stage, the sum sent back."""
+        shape = total.shape
+        if self.prev is not None:
+            total += decode_tensors(self.prev.recv(REDUCE_UP))["t"].reshape(shape)
+        if self.next is not None:
+            self.next.send(REDUCE_UP, encode_tensors({"t": total}))
+            total = decode_tensors(self.next.recv(REDUCE_DOWN))["t"].reshape(shape)
+        if self.prev is not None:
+            self.prev.send(REDUCE_DOWN, encode_tensors({"t": total}))
+        return total
 
     def barrier(self) -> None:
         self.cpu_all_reduce_(torch.zeros(1, dtype=torch.int32))
@@ -279,34 +385,60 @@ class StageCalls:
 
     def call(self, payload: bytes, want_reply: bool) -> list[bytes]:
         """From the last stage: ask every earlier stage to run ``payload``.
-        Returns the earlier stages' replies, first stage first."""
-        assert self.group.is_last_rank
+        Returns the earlier stages' replies, first stage first, one per
+        tensor-parallel rank."""
+        self.send_call(payload, want_reply)
+        return self.recv_replies() if want_reply else []
+
+    def send_call(self, payload: bytes, want_reply: bool) -> None:
+        """The first half of ``call``: the last stage sends the call and runs
+        its own part before it waits for the replies."""
+        assert self.group.is_last_rank and self.group.is_leader
+        if self.group.prev is not None:
+            self.group.prev.send(CALL, bytes([1 if want_reply else 0]) + payload)
+
+    def recv_replies(self) -> list[bytes]:
+        assert self.group.is_last_rank and self.group.is_leader
         if self.group.prev is None:
-            return []
-        self.group.prev.send(CALL, bytes([1 if want_reply else 0]) + payload)
-        if not want_reply:
             return []
         return _split_replies(self.group.prev.recv(REPLY))
 
     def serve_one(self, run: Callable[[bytes], bytes]) -> bool:
         """On an earlier stage: take one call, pass it back, run it, reply.
+        Every tensor-parallel rank of the stage calls this in step: the
+        leader reads the call and shares it, and gathers the ranks' replies.
         Returns False once the stream from the next stage closes."""
-        assert not self.group.is_last_rank and self.group.next is not None
-        try:
-            frame = self.group.next.recv(CALL)
-        except ConnectionError:
-            return False
+        group = self.group
+        local = group.local
+        assert not group.is_last_rank
+        if group.is_leader:
+            assert group.next is not None
+            try:
+                frame: bytes | None = group.next.recv(CALL)
+            except ConnectionError:
+                frame = None
+            if local is not None:
+                local.share_object(frame, local.control)
+            if frame is None:
+                return False
+            if group.prev is not None:
+                group.prev.send(CALL, frame)
+        else:
+            assert local is not None
+            frame = local.share_object(None, local.control)
+            if frame is None:
+                return False
         want_reply, payload = frame[0] == 1, frame[1:]
-        if self.group.prev is not None:
-            self.group.prev.send(CALL, frame)
         reply = run(payload)
-        if want_reply:
+        if not want_reply:
+            return True
+        replies = [reply] if local is None else local.gather_objects(reply, local.control)
+        if group.is_leader:
+            assert replies is not None and group.next is not None
             earlier = (
-                _split_replies(self.group.prev.recv(REPLY))
-                if self.group.prev is not None
-                else []
+                _split_replies(group.prev.recv(REPLY)) if group.prev is not None else []
             )
-            self.group.next.send(REPLY, _join_replies([*earlier, reply]))
+            group.next.send(REPLY, _join_replies([*earlier, *replies]))
         return True
 
 
@@ -353,14 +485,35 @@ def open_stage_group(parallel_config: Any, local_rank: int = 0) -> "StreamPipeli
     """This process's pipeline group from its parallel config: connect to the
     previous stage first, then wait for the next one (so the chain forms from
     the first stage on, whatever order the processes start in)."""
-    if parallel_config.tensor_parallel_size != 1:
-        raise NotImplementedError(
-            "stream pipeline stages run one tensor-parallel rank each for now"
-        )
+    if parallel_config.prefill_context_parallel_size != 1:
+        raise NotImplementedError("stream pipeline stages take no context parallelism")
     stage = parallel_config.pipeline_stream_stage
     stages = parallel_config.pipeline_parallel_size
-    prev = connect(parallel_config.pipeline_stream_prev) if stage > 0 else None
-    nxt = accept(parallel_config.pipeline_stream_listen) if stage < stages - 1 else None
+    local = None
+    if parallel_config.tensor_parallel_size > 1:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        # every rank makes the stage's gloo groups, before the leader blocks
+        # on the streams
+        local = StageLocal(
+            get_tp_group().rank_in_group, parallel_config.tensor_parallel_size
+        )
+    leader = local is None or local.is_leader
+    prev = connect(parallel_config.pipeline_stream_prev) if leader and stage > 0 else None
+    nxt = (
+        accept(parallel_config.pipeline_stream_listen)
+        if leader and stage < stages - 1
+        else None
+    )
+    # The ranks before this stage, counted along the chain.
+    offset = 0
+    if leader:
+        if prev is not None:
+            (offset,) = struct.unpack("<I", prev.recv(OFFSET))
+        if nxt is not None:
+            nxt.send(OFFSET, struct.pack("<I", offset + parallel_config.tensor_parallel_size))
+    if local is not None:
+        offset = local.share_object(offset, local.control)
     wire = parallel_config.pipeline_stream_wire_dtype
     return StreamPipelineGroup(
         stage,
@@ -369,6 +522,8 @@ def open_stage_group(parallel_config: Any, local_rank: int = 0) -> "StreamPipeli
         nxt,
         device=torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu",
         wire_dtype=_DTYPES[wire] if wire else None,
+        local=local,
+        rank_offset=offset,
     )
 
 

@@ -1100,9 +1100,14 @@ class ParallelConfig:
             if self.distributed_executor_backend is None and last:
                 from vllm.v1.executor.stream_pipeline_executor import (
                     StreamPipelineExecutor,
+                    StreamPipelineMultiprocExecutor,
                 )
 
-                self.distributed_executor_backend = StreamPipelineExecutor
+                self.distributed_executor_backend = (
+                    StreamPipelineMultiprocExecutor
+                    if self.world_size > 1
+                    else StreamPipelineExecutor
+                )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
