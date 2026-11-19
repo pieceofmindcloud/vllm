@@ -109,6 +109,8 @@ def test_a_stage_takes_its_place_after_the_earlier_stages_ranks():
     first, last = _chain(2)
     last.rank_offset = 2
     assert first.pipeline_rank == 0 and last.pipeline_rank == 2
+    last.prev.send(sp.OFFSET, b"")
+    assert first.next.recv(sp.OFFSET, timeout=5) == b""
     first.next.send(sp.OFFSET, (2).to_bytes(4, "little"))
     assert int.from_bytes(last.prev.recv(sp.OFFSET, timeout=5), "little") == 2
     last.destroy()

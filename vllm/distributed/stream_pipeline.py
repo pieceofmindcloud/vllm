@@ -42,7 +42,9 @@ CALL = 3
 REPLY = 4
 REDUCE_UP = 5
 REDUCE_DOWN = 6
-# At startup, from each stage to the next: how many ranks come before it.
+# At startup each stage asks the previous one (an empty OFFSET backward) how
+# many ranks come before it, and gets the count back (OFFSET forward): every
+# forward frame then answers something the later stage sent.
 OFFSET = 7
 
 _KINDS = (TENSORS, BROADCAST, CALL, REPLY, REDUCE_UP, REDUCE_DOWN, OFFSET)
@@ -509,8 +511,10 @@ def open_stage_group(parallel_config: Any, local_rank: int = 0) -> "StreamPipeli
     offset = 0
     if leader:
         if prev is not None:
+            prev.send(OFFSET, b"")
             (offset,) = struct.unpack("<I", prev.recv(OFFSET))
         if nxt is not None:
+            nxt.recv(OFFSET)
             nxt.send(OFFSET, struct.pack("<I", offset + parallel_config.tensor_parallel_size))
     if local is not None:
         offset = local.share_object(offset, local.control)
