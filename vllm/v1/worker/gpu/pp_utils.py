@@ -98,6 +98,17 @@ class PPHandler:
         self.sampled_tokens_broadcast = False
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
+    def _broadcast(self, tensor: torch.Tensor) -> None:
+        """The last rank's ``tensor`` into the same tensor of every rank: over
+        the stream pipeline transport when the stages use it, else NCCL."""
+        if getattr(self.broadcast_group, "use_stream_transport", False):
+            torch.cuda.current_stream(self.device).synchronize()
+            self.broadcast_group.broadcast_tensor(tensor)
+            return
+        torch.distributed.broadcast(
+            tensor, src=self.last_rank, group=self.broadcast_group
+        )
+
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
 
@@ -168,9 +179,7 @@ class PPHandler:
         if self.sampled_tokens_broadcast:
             with torch.cuda.stream(self.broadcast_stream):
                 self.broadcast_stream.wait_stream(self.main_stream)
-                torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
-                )
+                self._broadcast(draft_tokens)
                 draft_tokens.record_stream(self.broadcast_stream)
 
     def receive(self, input_batch: InputBatch, recv_drafts: bool) -> bool:
@@ -195,20 +204,14 @@ class PPHandler:
                 num_reqs, sample_len, dtype=torch.int64, device=self.device
             )
             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
-            torch.distributed.broadcast(
-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
-            )
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            self._broadcast(sampled_tokens)
+            self._broadcast(combined)
             draft_tokens = None
             if recv_drafts:
                 draft_tokens = sampled_tokens.new_empty(
                     num_reqs, self.num_speculative_steps
                 )
-                torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
-                )
+                self._broadcast(draft_tokens)
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
@@ -253,14 +256,8 @@ class PPHandler:
             self.broadcast_stream.wait_stream(self.main_stream)
             # receive() allocates the same width on the other ranks.
             assert sampled_token_ids.shape[-1] == self._sample_len(input_batch)
-            torch.distributed.broadcast(
-                sampled_token_ids.contiguous(),
-                src=self.last_rank,
-                group=self.broadcast_group,
-            )
+            self._broadcast(sampled_token_ids.contiguous())
             combined = torch.stack((num_sampled, num_rejected), dim=0)
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            self._broadcast(combined)
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
